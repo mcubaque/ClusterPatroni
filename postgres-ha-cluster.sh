@@ -360,74 +360,100 @@ cat > test-failover.sh << 'EOF'
 
 echo "=== PRUEBA DE FAILOVER DEL CLUSTER POSTGRESQL CON PATRONI ==="
 
-# Verificar el estado inicial del cluster
-echo "Estado inicial del cluster:"
-docker exec -i pg1 curl -s http://localhost:8008/cluster || echo "No se puede obtener el estado del cluster"
-
-# Identificar el nodo líder actual
-echo "Identificando el nodo líder actual..."
-LEADER=""
-for node in pg1 pg2 pg3; do
-  if docker exec -i $node curl -s http://localhost:8008 | grep -q '"role":"master"'; then
-    LEADER=$node
-    echo "El líder actual es: $LEADER"
-    break
-  fi
-done
-
-if [ -z "$LEADER" ]; then
-  echo "No se pudo identificar un líder. Abortando prueba."
-  exit 1
-fi
-
-# Insertar datos antes del failover
-echo "Insertando datos antes del failover..."
-docker exec -i -e PGPASSWORD=postgres $LEADER psql -h localhost -U postgres -c "INSERT INTO test_table (name) VALUES ('Antes del failover');"
-docker exec -i -e PGPASSWORD=postgres $LEADER psql -h localhost -U postgres -c "SELECT * FROM test_table;"
-
-# Detener el nodo líder
-echo "Deteniendo el nodo líder ($LEADER)..."
-docker stop $LEADER
-echo "Esperando 30 segundos para el failover..."
-sleep 30
-
-# Identificar el nuevo líder
-NEW_LEADER=""
-for node in pg1 pg2 pg3; do
-  if [ "$node" != "$LEADER" ] && docker ps -q -f name=$node | grep -q .; then
-    if docker exec -i $node curl -s http://localhost:8008 | grep -q '"role":"master"'; then
-      NEW_LEADER=$node
-      echo "El nuevo líder es: $NEW_LEADER"
-      break
+# Función limpia para obtener el líder
+get_leader() {
+  # Usar PostgreSQL directamente para identificar el líder
+  for node in pg1 pg2 pg3; do
+    if docker ps -q -f name=$node | grep -q .; then
+      # Verificar si este nodo está en modo primario (no en recuperación)
+      is_primary=$(docker exec -e PGPASSWORD=postgres $node psql -h localhost -U postgres -t -c "SELECT NOT pg_is_in_recovery();" 2>/dev/null)
+      
+      if [[ "$is_primary" == *"t"* ]]; then
+        echo "$node"
+        return 0
+      fi
     fi
-  fi
-done
+  done
+  
+  echo "Error: No se pudo identificar el líder"
+  return 1
+}
 
-if [ -z "$NEW_LEADER" ]; then
-  echo "No se pudo identificar un nuevo líder. Revisar el estado del cluster."
+# Paso 1: Identificar el líder actual
+echo "Identificando el líder actual..."
+LEADER=$(get_leader)
+
+if [ -z "$LEADER" ] || [ "$LEADER" == "Error: No se pudo identificar el líder" ]; then
+  echo "No se pudo identificar el líder. Abortando prueba."
   exit 1
 fi
 
-# Insertar datos después del failover
-echo "Insertando datos después del failover..."
-docker exec -i -e PGPASSWORD=postgres $NEW_LEADER psql -h localhost -U postgres -c "INSERT INTO test_table (name) VALUES ('Después del failover');"
-docker exec -i -e PGPASSWORD=postgres $NEW_LEADER psql -h localhost -U postgres -c "SELECT * FROM test_table;"
+echo "El líder actual es: $LEADER"
 
-# Reiniciar el nodo original
-echo "Reiniciando el nodo original..."
-docker start $LEADER
-echo "Esperando 30 segundos para que el nodo se reincorpore..."
+# Paso 2: Insertar datos antes del failover
+echo "Insertando datos antes del failover..."
+docker exec -e PGPASSWORD=postgres $LEADER psql -h localhost -U postgres -c "INSERT INTO test_table (name) VALUES ('Antes del failover');"
+docker exec -e PGPASSWORD=postgres $LEADER psql -h localhost -U postgres -c "SELECT * FROM test_table ORDER BY id DESC LIMIT 5;"
+
+# Paso 3: Detener el líder para forzar un failover
+echo "Deteniendo el líder $LEADER..."
+docker stop $LEADER
+echo "Esperando 30 segundos para que ocurra el failover..."
 sleep 30
 
-# Verificar que el nodo original se ha unido como réplica
-echo "Verificando estado del cluster después de reiniciar el nodo original..."
-docker exec -i $NEW_LEADER curl -s http://localhost:8008/cluster
+# Paso 4: Identificar el nuevo líder
+echo "Identificando el nuevo líder..."
+NEW_LEADER=$(get_leader)
 
-# Verificar datos en todos los nodos
+if [ -z "$NEW_LEADER" ] || [ "$NEW_LEADER" == "Error: No se pudo identificar el líder" ]; then
+  echo "No se pudo identificar un nuevo líder. El failover podría haber fallado."
+  echo "Intentando recuperar el cluster reiniciando el líder original..."
+  docker start $LEADER
+  sleep 30
+  exit 1
+fi
+
+echo "El nuevo líder es: $NEW_LEADER"
+
+# Paso 5: Insertar datos después del failover
+echo "Insertando datos después del failover..."
+docker exec -e PGPASSWORD=postgres $NEW_LEADER psql -h localhost -U postgres -c "INSERT INTO test_table (name) VALUES ('Después del failover');"
+docker exec -e PGPASSWORD=postgres $NEW_LEADER psql -h localhost -U postgres -c "SELECT * FROM test_table ORDER BY id DESC LIMIT 5;"
+
+# Paso 6: Recuperar el nodo caído
+echo "Recuperando el nodo caído $LEADER..."
+docker rm -f $LEADER
+rm -rf data/$LEADER/*
+mkdir -p data/$LEADER
+chmod -R 777 data/$LEADER
+docker compose up -d $LEADER
+echo "Esperando 45 segundos para que el nodo se reincorpore..."
+sleep 45
+
+# Paso 7: Verificar el estado final
+echo "Verificando estado final del cluster..."
 for node in pg1 pg2 pg3; do
   if docker ps -q -f name=$node | grep -q .; then
-    echo "Verificando datos en $node:"
-    docker exec -i -e PGPASSWORD=postgres $node psql -h localhost -U postgres -c "SELECT * FROM test_table;" || echo "No se pueden leer los datos en $node."
+    is_primary=$(docker exec -e PGPASSWORD=postgres $node psql -h localhost -U postgres -t -c "SELECT NOT pg_is_in_recovery();" 2>/dev/null)
+    
+    if [[ "$is_primary" == *"t"* ]]; then
+      echo "$node: LÍDER"
+    else
+      echo "$node: réplica"
+    fi
+  else
+    echo "$node: no está en ejecución"
+  fi
+done
+
+# Paso 8: Verificar datos en todos los nodos
+echo "Verificando datos en todos los nodos..."
+for node in pg1 pg2 pg3; do
+  if docker ps -q -f name=$node | grep -q .; then
+    echo "Datos en $node:"
+    docker exec -e PGPASSWORD=postgres $node psql -h localhost -U postgres -c "SELECT * FROM test_table ORDER BY id DESC LIMIT 5;"
+  else
+    echo "$node no está en ejecución"
   fi
 done
 
